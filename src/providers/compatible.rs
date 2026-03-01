@@ -51,6 +51,10 @@ pub struct OpenAiCompatibleProvider {
     api_mode: CompatibleApiMode,
     /// Optional max token cap propagated to outbound requests.
     max_tokens_override: Option<u32>,
+    /// Qwen/DashScope: enable extended thinking mode (`enable_thinking` request field).
+    /// Maps directly from `runtime.reasoning_enabled`. `None` omits the field entirely,
+    /// letting the provider use its own default. Only applied for Qwen provider instances.
+    enable_thinking: Option<bool>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -254,7 +258,19 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             api_mode,
             max_tokens_override: max_tokens_override.filter(|value| *value > 0),
+            enable_thinking: None,
         }
+    }
+
+    /// Set Qwen/DashScope extended-thinking mode.
+    ///
+    /// `enable_thinking` maps to the `enable_thinking` field in the request body and is
+    /// derived from `runtime.reasoning_enabled`. When `None` the field is omitted and the
+    /// provider uses its own default. Other providers are unaffected because only the Qwen
+    /// factory branch calls this method.
+    pub fn with_thinking(mut self, enable_thinking: Option<bool>) -> Self {
+        self.enable_thinking = enable_thinking;
+        self
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -403,6 +419,9 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Qwen/DashScope only: enable extended thinking mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,6 +616,9 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Qwen/DashScope only: enable extended thinking mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1663,6 +1685,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.enable_thinking,
         };
 
         let url = self.chat_completions_url();
@@ -1792,6 +1815,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.enable_thinking,
         };
 
         if self.should_use_responses_mode() {
@@ -1917,6 +1941,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            enable_thinking: self.enable_thinking,
         };
 
         if self.should_use_responses_mode() {
@@ -2039,6 +2064,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            enable_thinking: self.enable_thinking,
         };
 
         if self.should_use_responses_mode() {
@@ -2192,6 +2218,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
+            enable_thinking: self.enable_thinking,
         };
 
         let url = self.chat_completions_url();
@@ -2334,6 +2361,7 @@ mod tests {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            enable_thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -2342,6 +2370,44 @@ mod tests {
         // tools/tool_choice should be omitted when None
         assert!(!json.contains("tools"));
         assert!(!json.contains("tool_choice"));
+    }
+
+    #[test]
+    fn enable_thinking_serializes_when_set() {
+        let req = ApiChatRequest {
+            model: "qwen3-plus".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            temperature: 0.7,
+            max_tokens: None,
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+            enable_thinking: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"enable_thinking\":true"));
+    }
+
+    #[test]
+    fn enable_thinking_omitted_when_none() {
+        let req = ApiChatRequest {
+            model: "qwen3-plus".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            temperature: 0.7,
+            max_tokens: None,
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("enable_thinking"));
     }
 
     #[test]
@@ -3182,6 +3248,7 @@ mod tests {
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            enable_thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));

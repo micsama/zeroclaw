@@ -98,6 +98,14 @@ credential is not reused for fallback providers.
   - Qwen OAuth API does not return rate limit headers
   - Actual request counting requires local counter (not implemented)
   - Rate limit errors are detected and parsed for retry backoff
+- **Thinking Models**: `qwen3` family supports extended thinking mode
+  - Control via `runtime.reasoning_enabled` in `config.toml`:
+    ```toml
+    [runtime]
+    reasoning_enabled = false  # disable thinking; omit to use provider default
+    ```
+  - Maps to `enable_thinking` in the DashScope request body
+  - Note: applies only to DashScope API key access (`qwen`/`dashscope`). For Ollama-hosted Qwen, use `provider = "ollama"` — reasoning is controlled via `think` field (same `reasoning_enabled` config)
 - **Limitations**:
   - OAuth free tier limited to 1 model and 1000 requests/day
   - See test report: `docs/qwen-provider-test-report.md`
