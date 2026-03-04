@@ -85,6 +85,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -98,6 +99,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

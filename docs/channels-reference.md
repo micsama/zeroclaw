@@ -392,6 +392,9 @@ mention_only = false                # legacy fallback; used when group_reply.mod
 use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+stream_mode = "off"                 # optional: off | partial — "partial" enables CardKit v1 streaming cards
+draft_update_interval_ms = 3000     # optional: min ms between card update calls; recommend 200 for streaming (default: 3000)
+max_draft_edits = 20                # optional: max card updates per response (default: 20)
 
 [channels_config.lark.group_reply]
 mode = "all_messages"               # optional: all_messages | mention_only
@@ -409,6 +412,9 @@ verification_token = ""             # optional
 allowed_users = ["*"]
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+stream_mode = "off"                 # optional: off | partial — "partial" enables CardKit v1 streaming cards
+draft_update_interval_ms = 3000     # optional: min ms between card update calls; recommend 200 for streaming (default: 3000)
+max_draft_edits = 20                # optional: max card updates per response (default: 20)
 
 [channels_config.feishu.group_reply]
 mode = "all_messages"               # optional: all_messages | mention_only

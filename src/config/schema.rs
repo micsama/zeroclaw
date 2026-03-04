@@ -5551,6 +5551,10 @@ pub struct LarkConfig {
     /// Maximum number of edits per draft message before stopping updates.
     #[serde(default = "default_lark_max_draft_edits")]
     pub max_draft_edits: u32,
+    /// Streaming output mode. Set to "partial" to enable CardKit v1 card streaming.
+    /// Default: "off" (plain text messages, no streaming).
+    #[serde(default)]
+    pub stream_mode: StreamMode,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -5610,6 +5614,10 @@ pub struct FeishuConfig {
     /// Maximum number of draft edits per message before finalizing.
     #[serde(default = "default_lark_max_draft_edits")]
     pub max_draft_edits: u32,
+    /// Streaming output mode. Set to "partial" to enable CardKit v1 card streaming.
+    /// Default: "off" (plain text messages, no streaming).
+    #[serde(default)]
+    pub stream_mode: StreamMode,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -13633,6 +13641,7 @@ default_model = "legacy-model"
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -13659,6 +13668,7 @@ default_model = "legacy-model"
             port: Some(9898),
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -13734,6 +13744,7 @@ default_model = "legacy-model"
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -13757,6 +13768,7 @@ default_model = "legacy-model"
             port: Some(9898),
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -13834,6 +13846,7 @@ use_feishu = true
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         });
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
@@ -13865,6 +13878,7 @@ use_feishu = true
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            stream_mode: crate::config::schema::StreamMode::Off,
         });
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);

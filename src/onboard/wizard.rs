@@ -5905,6 +5905,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                     draft_update_interval_ms: 3000,
                     max_draft_edits: 20,
+                    stream_mode: crate::config::schema::StreamMode::Off,
                 });
             }
             ChannelMenuChoice::Nostr => {

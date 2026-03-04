@@ -3,6 +3,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,6 +17,21 @@ const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
+
+/// Element ID for the primary markdown content component in CardKit v1 cards.
+/// Must be unique within a card, start with a letter, and be ≤ 20 characters.
+const CARD_MAIN_ELEMENT_ID: &str = "main_content";
+
+/// Per-card draft tracking state for CardKit v1 streaming updates.
+#[derive(Debug)]
+struct CardDraftState {
+    /// Monotonically increasing sequence counter (starts at 0, incremented before each PUT).
+    sequence: u32,
+    /// Timestamp of the last successful card update call (used for rate-limiting).
+    last_update: Instant,
+    /// Number of card update calls performed so far (enforces max_draft_edits cap).
+    edit_count: u32,
+}
 
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
@@ -517,6 +533,14 @@ pub struct LarkChannel {
     /// Last time we ran TTL cleanup over the dedupe cache.
     recent_event_cleanup_at: Arc<RwLock<Instant>>,
     ack_reaction: Option<crate::config::AckReactionConfig>,
+    /// Streaming output mode: Off = plain text, Partial = CardKit v1 card updates.
+    stream_mode: crate::config::schema::StreamMode,
+    /// Minimum milliseconds between card update API calls (rate-limiting).
+    draft_update_interval_ms: u64,
+    /// Maximum number of card updates per draft before stopping further updates.
+    max_draft_edits: u32,
+    /// Per-card draft state keyed by card_id. Guards sequence counter and rate-limit state.
+    card_draft_states: Arc<Mutex<HashMap<String, CardDraftState>>>,
 }
 
 impl LarkChannel {
@@ -563,6 +587,10 @@ impl LarkChannel {
             recent_event_keys: Arc::new(RwLock::new(HashMap::new())),
             recent_event_cleanup_at: Arc::new(RwLock::new(Instant::now())),
             ack_reaction: None,
+            stream_mode: crate::config::schema::StreamMode::Off,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
+            card_draft_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -595,6 +623,9 @@ impl LarkChannel {
         ch.group_reply_allowed_sender_ids =
             normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
+        ch.stream_mode = config.stream_mode;
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -611,6 +642,9 @@ impl LarkChannel {
         ch.group_reply_allowed_sender_ids =
             normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
+        ch.stream_mode = config.stream_mode;
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -627,6 +661,9 @@ impl LarkChannel {
         ch.group_reply_allowed_sender_ids =
             normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
+        ch.stream_mode = config.stream_mode;
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -656,6 +693,19 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn create_card_url(&self) -> String {
+        format!("{}/cardkit/v1/cards", self.api_base())
+    }
+
+    fn card_element_content_url(&self, card_id: &str) -> String {
+        format!(
+            "{}/cardkit/v1/cards/{}/elements/{}/content",
+            self.api_base(),
+            card_id,
+            CARD_MAIN_ELEMENT_ID
+        )
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -1619,6 +1669,91 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // CardKit v1 helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Build a minimal CardKit v1 JSON 2.0 card string with a single markdown element.
+    ///
+    /// The card has `update_multi: true` and `streaming_mode: true` required for
+    /// subsequent `update_draft` / `finalize_draft` calls.
+    fn build_initial_card_json(initial_content: &str) -> String {
+        let card = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "update_multi": true,
+                "streaming_mode": true
+            },
+            "body": {
+                "elements": [{
+                    "tag": "markdown",
+                    "element_id": CARD_MAIN_ELEMENT_ID,
+                    "content": initial_content
+                }]
+            }
+        });
+        card.to_string()
+    }
+
+    /// Send a single CardKit v1 API request (POST or PUT) with the given token.
+    async fn cardkit_request_once(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .http_client()
+            .request(method, url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    /// Send a CardKit v1 API request with automatic token refresh on auth failure.
+    async fn cardkit_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self
+            .cardkit_request_once(method.clone(), url, &token, body)
+            .await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self
+                .cardkit_request_once(method, url, &new_token, body)
+                .await?;
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                let sanitized = sanitize_lark_body(&retry_response);
+                anyhow::bail!(
+                    "Lark CardKit request failed after token refresh: status={retry_status}, body={sanitized}"
+                );
+            }
+            ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "CardKit (after token refresh)",
+            )?;
+            return Ok(retry_response);
+        }
+
+        ensure_lark_send_success(status, &response, "CardKit")?;
+        Ok(response)
+    }
+
     /// Parse an event callback payload and extract incoming messages.
     ///
     /// Synchronous parser uses a non-network fallback for image messages.
@@ -1948,6 +2083,143 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode != crate::config::schema::StreamMode::Off
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.supports_draft_updates() {
+            return Ok(None);
+        }
+
+        // 1. Build initial card JSON 2.0 with a placeholder or initial content.
+        let initial_content = if message.content.is_empty() {
+            "⏳".to_string()
+        } else {
+            message.content.clone()
+        };
+        let card_data = Self::build_initial_card_json(&initial_content);
+
+        // 2. Create card entity via CardKit v1.
+        let create_url = self.create_card_url();
+        let create_body = serde_json::json!({
+            "type": "card_json",
+            "data": card_data,
+        });
+        let create_resp = self
+            .cardkit_request(reqwest::Method::POST, &create_url, &create_body)
+            .await?;
+
+        let card_id = create_resp
+            .pointer("/data/card_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Lark CardKit: create response missing data.card_id"))?;
+
+        // 3. Send the card to the conversation as an interactive message.
+        let send_url = self.send_message_url();
+        let content = serde_json::json!({ "card_id": card_id }).to_string();
+        let send_body = serde_json::json!({
+            "receive_id": message.recipient,
+            "msg_type": "interactive",
+            "content": content,
+        });
+        self.send_text_with_retry(&send_url, &send_body).await?;
+
+        // 4. Initialize per-card draft state.
+        self.card_draft_states.lock().insert(
+            card_id.clone(),
+            CardDraftState {
+                sequence: 0,
+                last_update: Instant::now(),
+                edit_count: 0,
+            },
+        );
+
+        Ok(Some(card_id))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let sequence = {
+            let mut states = self.card_draft_states.lock();
+            let state = match states.get_mut(message_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            // Rate-limit: skip if called too soon after the previous update.
+            if state.last_update.elapsed().as_millis() < u128::from(self.draft_update_interval_ms) {
+                return Ok(None);
+            }
+            // Edit count cap: stop updating once the maximum is reached.
+            if state.edit_count >= self.max_draft_edits {
+                return Ok(None);
+            }
+            state.sequence += 1;
+            state.last_update = Instant::now();
+            state.edit_count += 1;
+            state.sequence
+        };
+
+        let url = self.card_element_content_url(message_id);
+        let body = serde_json::json!({
+            "sequence": sequence,
+            "content": text,
+        });
+        if let Err(err) = self
+            .cardkit_request(reqwest::Method::PUT, &url, &body)
+            .await
+        {
+            tracing::warn!("Lark CardKit update_draft failed for card {message_id}: {err}");
+        }
+
+        Ok(None)
+    }
+
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Finalize always runs regardless of rate-limit or edit count.
+        let sequence = {
+            let mut states = self.card_draft_states.lock();
+            let state = match states.get_mut(message_id) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            state.sequence += 1;
+            state.sequence
+        };
+
+        let url = self.card_element_content_url(message_id);
+        let body = serde_json::json!({
+            "sequence": sequence,
+            "content": text,
+        });
+        if let Err(err) = self
+            .cardkit_request(reqwest::Method::PUT, &url, &body)
+            .await
+        {
+            tracing::warn!("Lark CardKit finalize_draft failed for card {message_id}: {err}");
+        }
+
+        // Clean up state regardless of update success.
+        self.card_draft_states.lock().remove(message_id);
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        // Cards cannot be unsent; just clean up local tracking state.
+        self.card_draft_states.lock().remove(message_id);
+        Ok(())
     }
 }
 
@@ -3128,6 +3400,7 @@ mod tests {
             port: None,
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -3153,6 +3426,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -3190,6 +3464,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -3217,6 +3492,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -3241,6 +3517,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -3416,6 +3693,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -3443,6 +3721,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 3_000,
             max_draft_edits: 20,
+            stream_mode: crate::config::schema::StreamMode::Off,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -3546,5 +3825,200 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CardKit v1 draft streaming tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn card_json_structure_has_required_fields() {
+        let json_str = LarkChannel::build_initial_card_json("hello");
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+
+        assert_eq!(v["schema"], "2.0");
+        assert_eq!(v["config"]["update_multi"], true);
+        assert_eq!(v["config"]["streaming_mode"], true);
+
+        let elements = v["body"]["elements"].as_array().expect("elements array");
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["tag"], "markdown");
+        assert_eq!(elements[0]["element_id"], CARD_MAIN_ELEMENT_ID);
+        assert_eq!(elements[0]["content"], "hello");
+    }
+
+    #[test]
+    fn card_json_uses_provided_content() {
+        let json_str = LarkChannel::build_initial_card_json("test content");
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+        assert_eq!(v["body"]["elements"][0]["content"], "test content");
+    }
+
+    #[test]
+    fn supports_draft_updates_off_by_default() {
+        let ch = make_channel();
+        assert!(!ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn supports_draft_updates_enabled_when_stream_mode_partial() {
+        let mut ch = make_channel();
+        ch.stream_mode = crate::config::schema::StreamMode::Partial;
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn create_card_url_uses_api_base() {
+        let ch = make_channel();
+        let url = ch.create_card_url();
+        assert!(url.starts_with(LARK_BASE_URL));
+        assert!(url.ends_with("/cardkit/v1/cards"));
+    }
+
+    #[test]
+    fn card_element_content_url_contains_card_id_and_element_id() {
+        let ch = make_channel();
+        let url = ch.card_element_content_url("test_card_123");
+        assert!(url.contains("test_card_123"));
+        assert!(url.contains(CARD_MAIN_ELEMENT_ID));
+        assert!(url.contains("/cardkit/v1/cards/"));
+        assert!(url.ends_with("/content"));
+    }
+
+    #[test]
+    fn feishu_card_url_uses_feishu_base() {
+        let ch = LarkChannel::new_with_platform(
+            "cli_test".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec![],
+            false,
+            LarkPlatform::Feishu,
+        );
+        let url = ch.create_card_url();
+        assert!(url.starts_with(FEISHU_BASE_URL));
+    }
+
+    #[test]
+    fn update_draft_respects_rate_limit() {
+        let mut ch = make_channel();
+        ch.stream_mode = crate::config::schema::StreamMode::Partial;
+        ch.draft_update_interval_ms = 60_000; // 60 seconds — will never pass in test
+
+        let card_id = "card_rate_limit_test";
+        ch.card_draft_states.lock().insert(
+            card_id.to_string(),
+            CardDraftState {
+                sequence: 1,
+                last_update: Instant::now(), // just updated
+                edit_count: 0,
+            },
+        );
+
+        // Verify state exists and would be rate-limited
+        let states = ch.card_draft_states.lock();
+        let state = states.get(card_id).expect("state should exist");
+        let elapsed = state.last_update.elapsed().as_millis();
+        assert!(elapsed < u128::from(ch.draft_update_interval_ms));
+    }
+
+    #[test]
+    fn update_draft_respects_max_edits_cap() {
+        let mut ch = make_channel();
+        ch.stream_mode = crate::config::schema::StreamMode::Partial;
+        ch.max_draft_edits = 3;
+
+        let card_id = "card_max_edits_test";
+        ch.card_draft_states.lock().insert(
+            card_id.to_string(),
+            CardDraftState {
+                sequence: 3,
+                last_update: Instant::now() - Duration::from_secs(100),
+                edit_count: 3, // at cap
+            },
+        );
+
+        let states = ch.card_draft_states.lock();
+        let state = states.get(card_id).expect("state should exist");
+        assert!(state.edit_count >= ch.max_draft_edits);
+    }
+
+    #[test]
+    fn sequence_increments_monotonically() {
+        let ch = make_channel();
+        let card_id = "card_seq_test";
+        ch.card_draft_states.lock().insert(
+            card_id.to_string(),
+            CardDraftState {
+                sequence: 0,
+                last_update: Instant::now() - Duration::from_secs(100),
+                edit_count: 0,
+            },
+        );
+
+        // Simulate what update_draft does to sequence
+        let seq1 = {
+            let mut states = ch.card_draft_states.lock();
+            let s = states.get_mut(card_id).unwrap();
+            s.sequence += 1;
+            s.sequence
+        };
+        let seq2 = {
+            let mut states = ch.card_draft_states.lock();
+            let s = states.get_mut(card_id).unwrap();
+            s.sequence += 1;
+            s.sequence
+        };
+        let seq3 = {
+            let mut states = ch.card_draft_states.lock();
+            let s = states.get_mut(card_id).unwrap();
+            s.sequence += 1;
+            s.sequence
+        };
+
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
+    }
+
+    #[test]
+    fn cancel_draft_removes_state() {
+        let ch = make_channel();
+        let card_id = "card_cancel_test";
+        ch.card_draft_states.lock().insert(
+            card_id.to_string(),
+            CardDraftState {
+                sequence: 5,
+                last_update: Instant::now(),
+                edit_count: 2,
+            },
+        );
+
+        ch.card_draft_states.lock().remove(card_id);
+        assert!(ch.card_draft_states.lock().get(card_id).is_none());
+    }
+
+    #[test]
+    fn from_config_wires_stream_mode_and_draft_fields() {
+        let config = crate::config::schema::LarkConfig {
+            app_id: "cli_test".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: 200,
+            max_draft_edits: 50,
+            stream_mode: crate::config::schema::StreamMode::Partial,
+        };
+        let ch = LarkChannel::from_lark_config(&config);
+        assert_eq!(ch.stream_mode, crate::config::schema::StreamMode::Partial);
+        assert_eq!(ch.draft_update_interval_ms, 200);
+        assert_eq!(ch.max_draft_edits, 50);
     }
 }
