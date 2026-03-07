@@ -541,6 +541,8 @@ pub struct LarkChannel {
     max_draft_edits: u32,
     /// Per-card draft state keyed by card_id. Guards sequence counter and rate-limit state.
     card_draft_states: Arc<Mutex<HashMap<String, CardDraftState>>>,
+    /// Maps approval card_id → chat_id for routing card.action.trigger callbacks.
+    approval_card_chats: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl LarkChannel {
@@ -591,6 +593,7 @@ impl LarkChannel {
             draft_update_interval_ms: 3000,
             max_draft_edits: 20,
             card_draft_states: Arc::new(Mutex::new(HashMap::new())),
+            approval_card_chats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1117,6 +1120,62 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
+                    // Handle card button callback before the IM message filter.
+                    if event.header.event_type == "card.action.trigger" {
+                        let action = event.event.pointer("/action/value/action")
+                            .and_then(|v| v.as_str()).unwrap_or("");
+                        let req_id = event.event.pointer("/action/value/request_id")
+                            .and_then(|v| v.as_str()).unwrap_or("");
+                        let card_id = event.event.pointer("/card/card_id")
+                            .and_then(|v| v.as_str()).unwrap_or("");
+                        let sender_open_id = event.event.pointer("/user/open_id")
+                            .and_then(|v| v.as_str()).unwrap_or("");
+
+                        if action.is_empty() || req_id.is_empty() {
+                            tracing::debug!("Lark WS: card.action.trigger missing action/request_id");
+                            continue;
+                        }
+                        if !self.is_user_allowed(sender_open_id) {
+                            tracing::warn!("Lark WS: card action from {sender_open_id} (not in allowed_users)");
+                            continue;
+                        }
+                        let chat_id = self.approval_card_chats.lock().get(card_id).cloned();
+                        let chat_id = match chat_id {
+                            Some(id) => id,
+                            None => {
+                                tracing::warn!("Lark WS: card.action.trigger unknown card_id={card_id}");
+                                continue;
+                            }
+                        };
+                        let command = match action {
+                            "approve" => format!("/approve-allow {req_id}"),
+                            "deny"    => format!("/approve-deny {req_id}"),
+                            other => {
+                                tracing::debug!("Lark WS: unknown card action '{other}'");
+                                continue;
+                            }
+                        };
+                        tracing::debug!(
+                            action = %action, request_id = %req_id,
+                            sender = %sender_open_id,
+                            "Lark WS: card action → {command}"
+                        );
+                        let channel_msg = ChannelMessage {
+                            id: Uuid::new_v4().to_string(),
+                            sender: chat_id.clone(),
+                            reply_target: chat_id,
+                            content: command,
+                            channel: self.channel_name().to_string(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            thread_ts: None,
+                        };
+                        if tx.send(channel_msg).await.is_err() { break; }
+                        continue;
+                    }
+
                     if event.header.event_type != "im.message.receive_v1" { continue; }
 
                     let event_payload = event.event;
@@ -1682,7 +1741,12 @@ impl LarkChannel {
             "schema": "2.0",
             "config": {
                 "update_multi": true,
-                "streaming_mode": true
+                "streaming_mode": true,
+                "streaming_config": {
+                    "print_frequency_ms": { "default": 30 },
+                    "print_step": { "default": 4 },
+                    "print_strategy": "fast"
+                }
             },
             "body": {
                 "elements": [{
@@ -1693,6 +1757,44 @@ impl LarkChannel {
             }
         });
         card.to_string()
+    }
+
+    /// Build a CardKit v1 JSON 2.0 approval card with allow/deny buttons.
+    fn build_approval_card_json(tool_name: &str, request_id: &str, args_preview: &str) -> String {
+        serde_json::json!({
+            "schema": "2.0",
+            "config": { "update_multi": true },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": format!(
+                            "**工具调用审批**\n工具: `{tool_name}`\n请求 ID: `{request_id}`\n\n**参数：**\n```\n{args_preview}\n```"
+                        )
+                    },
+                    {
+                        "tag": "button",
+                        "element_id": "approve_btn",
+                        "text": { "tag": "plain_text", "content": "✅ 允许" },
+                        "behaviors": [{
+                            "type": "callback",
+                            "value": { "action": "approve", "request_id": request_id }
+                        }],
+                        "style": { "type": "primary" }
+                    },
+                    {
+                        "tag": "button",
+                        "element_id": "deny_btn",
+                        "text": { "tag": "plain_text", "content": "❌ 拒绝" },
+                        "behaviors": [{
+                            "type": "callback",
+                            "value": { "action": "deny", "request_id": request_id }
+                        }]
+                    }
+                ]
+            }
+        })
+        .to_string()
     }
 
     /// Send a single CardKit v1 API request (POST or PUT) with the given token.
@@ -2108,9 +2210,11 @@ impl Channel for LarkChannel {
             "type": "card_json",
             "data": card_data,
         });
+        tracing::debug!(create_body = %create_body, "Lark CardKit: create card request");
         let create_resp = self
             .cardkit_request(reqwest::Method::POST, &create_url, &create_body)
             .await?;
+        tracing::debug!(create_resp = %create_resp, "Lark CardKit: create card response");
 
         let card_id = create_resp
             .pointer("/data/card_id")
@@ -2119,13 +2223,25 @@ impl Channel for LarkChannel {
             .ok_or_else(|| anyhow::anyhow!("Lark CardKit: create response missing data.card_id"))?;
 
         // 3. Send the card to the conversation as an interactive message.
+        // Use card_id reference so subsequent CardKit PUT updates propagate to
+        // the IM message (update_multi: true only works with card_id references).
         let send_url = self.send_message_url();
-        let content = serde_json::json!({ "card_id": card_id }).to_string();
+        let content = serde_json::json!({
+            "type": "card",
+            "data": { "card_id": &card_id }
+        })
+        .to_string();
+        tracing::debug!(
+            card_id = %card_id,
+            content = %content,
+            "Lark CardKit: sending interactive message with card_id reference"
+        );
         let send_body = serde_json::json!({
             "receive_id": message.recipient,
             "msg_type": "interactive",
             "content": content,
         });
+        tracing::debug!(send_body = %send_body, "Lark CardKit: full IM send_body");
         self.send_text_with_retry(&send_url, &send_body).await?;
 
         // 4. Initialize per-card draft state.
@@ -2219,6 +2335,56 @@ impl Channel for LarkChannel {
     async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
         // Cards cannot be unsent; just clean up local tracking state.
         self.card_draft_states.lock().remove(message_id);
+        Ok(())
+    }
+
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        _thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 300 {
+            let end = crate::util::floor_utf8_char_boundary(&raw_args, 300);
+            format!("{}...", &raw_args[..end])
+        } else {
+            raw_args
+        };
+
+        // 1. Create approval card entity via CardKit v1.
+        let card_json = Self::build_approval_card_json(tool_name, request_id, &args_preview);
+        let create_url = self.create_card_url();
+        let create_body = serde_json::json!({ "type": "card_json", "data": card_json });
+        tracing::debug!(create_body = %create_body, "Lark CardKit: create approval card request");
+        let create_resp = self
+            .cardkit_request(reqwest::Method::POST, &create_url, &create_body)
+            .await?;
+        tracing::debug!(create_resp = %create_resp, "Lark CardKit: create approval card response");
+
+        let card_id = create_resp
+            .pointer("/data/card_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Lark CardKit: approval card create missing data.card_id"))?;
+
+        // 2. Store card_id → chat_id so card.action.trigger callbacks can route back.
+        self.approval_card_chats
+            .lock()
+            .insert(card_id.clone(), recipient.to_string());
+
+        // 3. Send to conversation via card_id reference.
+        let send_url = self.send_message_url();
+        let content = serde_json::json!({ "type": "card", "data": { "card_id": &card_id } }).to_string();
+        let send_body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "interactive",
+            "content": content,
+        });
+        tracing::debug!(send_body = %send_body, "Lark CardKit: full approval IM send_body");
+        self.send_text_with_retry(&send_url, &send_body).await?;
         Ok(())
     }
 }
